@@ -39,7 +39,7 @@
 # 2021-04-19 - Restore original state when interrupted - Onno
 # 2026-10-07 - Use libvirt backup API instead of snapshot + blockcommit;
 #              back up the inactive (persistent) XML;
-#              refuse to back up into a dir with VM images - Onno
+#              refuse to back up into a dir with VM images - Onno & Claude
 
 
 ##############################################################
