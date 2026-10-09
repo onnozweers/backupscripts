@@ -40,6 +40,7 @@
 # 2026-10-07 - Use libvirt backup API instead of snapshot + blockcommit;
 #              back up the inactive (persistent) XML;
 #              refuse to back up into a dir with VM images - Onno & Claude
+# 2026-10-09 - Retry thawing and report VMs that stay frozen - Onno & Claude
 
 
 ##############################################################
@@ -52,6 +53,9 @@ MIN_LIBVIRT_VERSION='6.0.0'
 MIN_QEMU_VERSION='4.2.0'
 # Seconds between checks whether a backup job is done
 POLL_INTERVAL=5
+# How often to try to thaw the filesystems of a VM, and seconds between tries
+THAW_TRIES=5
+THAW_RETRY_INTERVAL=5
 
 ##############################################################
 #   Help Function
@@ -272,6 +276,22 @@ wait_for_backup_job() {
   grep --silent '^Job type: *Completed' <<<"$jobinfo"
 }
 
+thaw_vm() {
+  # Thaws the filesystems of $1, with retries. A Linux guest stays frozen until
+  # it is thawed (there is no timeout), so writes in the VM would hang.
+  VM="$1"
+  for (( try = 1 ; try <= THAW_TRIES ; try++ )) ; do
+    virsh domfsthaw "$VM" >/dev/null && return 0
+    if [ $try -lt $THAW_TRIES ] ; then
+      echo "WARNING: could not thaw the filesystems of '$VM' (try $try of $THAW_TRIES); retrying in $THAW_RETRY_INTERVAL seconds."
+      sleep $THAW_RETRY_INTERVAL
+    fi
+  done
+  echo "ERROR: the filesystems of '$VM' may still be frozen! Writes in the VM will hang."
+  echo "       Please check, and thaw them with: virsh domfsthaw '$VM'"
+  return 1
+}
+
 backup_vm() {
   VM="$1"
   if [ "$(virsh domstate "$VM")" != "running" ] ; then
@@ -308,9 +328,15 @@ backup_vm() {
   result=$?
   rm -f "$backupxml"
   [ $result -eq 0 ] && JOB_STARTED=1
+  # If thawing fails, FROZEN stays set so cleanup_vm tries again after the job.
+  # The backup itself is still fine, so we continue with it.
+  thaw_failed=''
   if [ -n "$FROZEN" ] ; then
-    virsh domfsthaw "$VM" >/dev/null
-    FROZEN=''
+    if thaw_vm "$VM" ; then
+      FROZEN=''
+    else
+      thaw_failed=1
+    fi
   fi
   [ $result -eq 0 ] || return 1
 
@@ -329,6 +355,7 @@ backup_vm() {
     && mv -f "$tmpfile" "${tmpfile%.tmp}" \
     || return 1
   done
+  [ -n "$thaw_failed" ] && return 1
   echo "Done."
 }
 
@@ -340,7 +367,7 @@ cleanup_vm() {
     virsh domjobabort "$CURRENT_VM"
   fi
   if [ -n "$FROZEN" ] ; then
-    virsh domfsthaw "$CURRENT_VM" >/dev/null
+    thaw_vm "$CURRENT_VM" || STILL_FROZEN_VMS+=("$CURRENT_VM")
   fi
   if [ ${#TMPFILES[@]} -gt 0 ] ; then
     rm -f "${TMPFILES[@]}"
@@ -373,6 +400,7 @@ check_target_dir
 # When the script is interrupted, abort the backup job, thaw and clean up.
 TMPFILES=()
 FAILED_VMS=()
+STILL_FROZEN_VMS=()
 # Backup files written in this run, to detect images with the same name.
 declare -A BACKUP_FILES
 trap cleanup_vm EXIT
@@ -393,6 +421,9 @@ while read -r VM <&3 ; do
     cleanup_vm
 done 3<<<"$VMLIST"
 
+if [ ${#STILL_FROZEN_VMS[@]} -gt 0 ] ; then
+    echo "ERROR: filesystems may still be frozen in: ${STILL_FROZEN_VMS[*]}"
+fi
 if [ ${#FAILED_VMS[@]} -gt 0 ] ; then
     echo "ERROR: backup failed for: ${FAILED_VMS[*]}"
     exit 1
